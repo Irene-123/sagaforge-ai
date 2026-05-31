@@ -2,6 +2,10 @@
 // container. This is the entrypoint for Railway (or any single-container)
 // deployment. On SIGTERM/SIGINT it forwards the signal to every child and
 // waits for graceful shutdown.
+//
+// The dashboard starts FIRST so the /health endpoint is available immediately
+// for Railway's healthcheck. Kafka-dependent services start after the broker
+// is reachable.
 package main
 
 import (
@@ -16,18 +20,6 @@ import (
 	"time"
 )
 
-// services lists every binary we expect in /app/bin/ (the Dockerfile puts them there).
-var services = []string{
-	"order-service",
-	"inventory-service",
-	"payment-service",
-	"fulfillment-service",
-	"saga-orchestrator",
-	"ai-insights-service",
-	"notification-service",
-	"dashboard",
-}
-
 func main() {
 	fmt.Println("=== SagaForge AI — Runner ===")
 
@@ -36,54 +28,78 @@ func main() {
 		os.Setenv("DASHBOARD_PORT", port)
 	}
 
-	// Wait for Redpanda/Kafka to be reachable before starting services.
-	waitForKafka()
-
-	// Ensure Kafka topics exist (best-effort; Redpanda auto-creates on first produce too).
-	ensureTopics()
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	var wg sync.WaitGroup
-	cmds := make([]*exec.Cmd, 0, len(services))
+	var mu sync.Mutex
+	var cmds []*exec.Cmd
 
-	for _, svc := range services {
-		svc := svc
-		binPath := fmt.Sprintf("/app/bin/%s", svc)
-
+	startService := func(name string) {
+		binPath := fmt.Sprintf("/app/bin/%s", name)
 		cmd := exec.CommandContext(ctx, binPath)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Env = os.Environ()
-
-		// Each child gets its own process group so we can signal them independently.
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "FATAL: start %s: %v\n", svc, err)
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "[runner] WARN: start %s: %v\n", name, err)
+			return
 		}
-		fmt.Printf("[runner] started %s (pid %d)\n", svc, cmd.Process.Pid)
+		fmt.Printf("[runner] started %s (pid %d)\n", name, cmd.Process.Pid)
+
+		mu.Lock()
 		cmds = append(cmds, cmd)
+		mu.Unlock()
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if err := cmd.Wait(); err != nil {
-				fmt.Fprintf(os.Stderr, "[runner] %s exited: %v\n", svc, err)
+				fmt.Fprintf(os.Stderr, "[runner] %s exited: %v\n", name, err)
 			} else {
-				fmt.Printf("[runner] %s exited cleanly\n", svc)
+				fmt.Printf("[runner] %s exited cleanly\n", name)
 			}
 		}()
 	}
+
+	// ── Phase 1: Start dashboard + order-service immediately ──
+	// Dashboard serves /health for Railway's healthcheck.
+	// Order-service serves the HTTP API the dashboard calls.
+	fmt.Println("[runner] phase 1: starting dashboard + order-service")
+	startService("dashboard")
+	startService("order-service")
+
+	// ── Phase 2: Wait for Kafka, then start event-driven services ──
+	go func() {
+		waitForKafka()
+
+		fmt.Println("[runner] phase 2: starting Kafka-dependent services")
+		kafkaServices := []string{
+			"inventory-service",
+			"payment-service",
+			"fulfillment-service",
+			"saga-orchestrator",
+			"ai-insights-service",
+			"notification-service",
+		}
+		for _, svc := range kafkaServices {
+			startService(svc)
+		}
+	}()
 
 	// Block until we receive a termination signal.
 	<-ctx.Done()
 	fmt.Println("[runner] shutting down children…")
 
 	// Forward SIGTERM to all children.
-	for _, cmd := range cmds {
+	mu.Lock()
+	snapshot := make([]*exec.Cmd, len(cmds))
+	copy(snapshot, cmds)
+	mu.Unlock()
+
+	for _, cmd := range snapshot {
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
@@ -98,7 +114,7 @@ func main() {
 		fmt.Println("[runner] all children stopped")
 	case <-time.After(10 * time.Second):
 		fmt.Println("[runner] force-killing remaining children")
-		for _, cmd := range cmds {
+		for _, cmd := range snapshot {
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
@@ -107,12 +123,12 @@ func main() {
 }
 
 // waitForKafka blocks until the first Kafka broker is reachable (TCP handshake).
+// Times out after 60 seconds and proceeds anyway.
 func waitForKafka() {
 	brokers := os.Getenv("KAFKA_BROKERS")
 	if brokers == "" {
 		brokers = "localhost:19092"
 	}
-	// Use just the first broker for the health check.
 	broker := brokers
 	for i, c := range brokers {
 		if c == ',' {
@@ -122,7 +138,7 @@ func waitForKafka() {
 	}
 
 	fmt.Printf("[runner] waiting for Kafka at %s …\n", broker)
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 30; i++ {
 		conn, err := net.DialTimeout("tcp", broker, 2*time.Second)
 		if err == nil {
 			conn.Close()
@@ -131,45 +147,5 @@ func waitForKafka() {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	fmt.Fprintln(os.Stderr, "[runner] WARNING: Kafka not reachable after 120s — starting anyway")
-}
-
-// ensureTopics creates the 7 required topics using kafka-go's Conn API.
-// This is best-effort; topics may already exist or Redpanda's auto-create
-// handles it.
-func ensureTopics() {
-	brokers := os.Getenv("KAFKA_BROKERS")
-	if brokers == "" {
-		brokers = "localhost:19092"
-	}
-	broker := brokers
-	for i, c := range brokers {
-		if c == ',' {
-			broker = brokers[:i]
-			break
-		}
-	}
-
-	conn, err := net.DialTimeout("tcp", broker, 5*time.Second)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[runner] skip topic creation: %v\n", err)
-		return
-	}
-	conn.Close()
-
-	// Use rpk if available (Redpanda image), otherwise topics auto-create
-	// on first produce with kafka-go when enable.auto.create.topics is set.
-	topics := []string{
-		"order-events",
-		"inventory-events",
-		"payment-events",
-		"fulfillment-events",
-		"saga-events",
-		"ai-insight-events",
-		"dlq",
-	}
-	for _, t := range topics {
-		fmt.Printf("[runner] ensuring topic: %s\n", t)
-	}
-	fmt.Println("[runner] topics will auto-create on first produce (Redpanda dev mode)")
+	fmt.Fprintln(os.Stderr, "[runner] WARNING: Kafka not reachable after 60s — starting services anyway")
 }
