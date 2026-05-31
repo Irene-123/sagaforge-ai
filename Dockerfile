@@ -1,7 +1,7 @@
 # Multi-stage build — one Dockerfile for all services
 # Build target is controlled by --build-arg SERVICE=<name>
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 ARG SERVICE
 WORKDIR /app
 COPY go.mod go.sum ./
