@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+vendor/
+
+# Claude
+.claude/
+ai-insights-service

@@ -1,0 +1,7 @@
+bin/
+.env
+.git/
+.claude/
+.DS_Store
+*.md
+!README.md

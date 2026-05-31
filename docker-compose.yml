@@ -1,0 +1,140 @@
+version: "3.9"
+
+# SagaForge AI — full local stack
+# Redpanda (Kafka-compatible) runs locally in Docker.
+# Supabase (Postgres) + Azure OpenAI are external — configured via .env.
+
+x-service: &service-defaults
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  restart: unless-stopped
+  depends_on:
+    redpanda:
+      condition: service_healthy
+    order-service:
+      condition: service_healthy
+
+services:
+  # ─── Kafka (Redpanda) ───
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.7
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --mode dev-container
+    ports:
+      - "19092:19092"   # Kafka API (external / from host)
+      - "18081:18081"   # Schema Registry
+      - "18082:18082"   # Panda Proxy (REST)
+      - "9644:9644"     # Admin API
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--api-urls", "localhost:9644"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redpanda-data:/var/redpanda/data
+
+  # Create topics on startup
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+        rpk topic create order-events inventory-events payment-events fulfillment-events saga-events ai-insight-events dlq
+        --brokers redpanda:9092
+        --partitions 3
+        --replicas 1
+        && echo '✅ All topics created'
+      "
+
+  # ─── Core services ───
+
+  order-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: order-service
+    ports:
+      - "${ORDER_SERVICE_PORT:-8081}:${ORDER_SERVICE_PORT:-8081}"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${ORDER_SERVICE_PORT:-8081}/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  inventory-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: inventory-service
+
+  payment-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: payment-service
+
+  fulfillment-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: fulfillment-service
+
+  # ─── Orchestration ───
+
+  saga-orchestrator:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: saga-orchestrator
+
+  # ─── Intelligence ───
+
+  ai-insights-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: ai-insights-service
+
+  # ─── Notifications ───
+
+  notification-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: notification-service
+
+  # ─── Dashboard ───
+
+  dashboard:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: dashboard
+    ports:
+      - "${DASHBOARD_PORT:-8080}:${DASHBOARD_PORT:-8080}"
+
+volumes:
+  redpanda-data:
