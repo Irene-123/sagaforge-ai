@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,11 @@ func (d *Dashboard) Start(ctx context.Context, addr string) error {
 	e.HideBanner = true
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{AllowOrigins: []string{"*"}}))
 	e.Use(middleware.Recover())
+
+	// Health check (used by Railway)
+	e.GET("/health", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok", "service": "sagaforge-ai"})
+	})
 
 	// Pages
 	e.GET("/", d.indexPage)
@@ -309,8 +315,13 @@ func (d *Dashboard) stats(c echo.Context) error {
 }
 
 func (d *Dashboard) simulateOrder(c echo.Context) error {
-	// POST to the order-service to create a test order
-	orderSvcURL := "http://localhost:8081/orders"
+	// POST to the order-service to create a test order.
+	// In Railway deployment, both services run in the same container.
+	orderPort := os.Getenv("ORDER_SERVICE_PORT")
+	if orderPort == "" {
+		orderPort = "8081"
+	}
+	orderSvcURL := fmt.Sprintf("http://localhost:%s/orders", orderPort)
 	body := `{
 		"customer_id": "cust-demo-001",
 		"items": [

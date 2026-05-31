@@ -1,0 +1,35 @@
+# ───────────────────────────────────────────────────────────
+# SagaForge AI — Railway deployment Dockerfile
+# Builds all 8 microservices + the runner supervisor into
+# a single container for cost-efficient deployment.
+# ───────────────────────────────────────────────────────────
+
+FROM golang:1.23-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Build every service binary + the runner
+RUN mkdir -p /out && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/order-service        ./cmd/order-service        && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/inventory-service     ./cmd/inventory-service     && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/payment-service       ./cmd/payment-service       && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/fulfillment-service   ./cmd/fulfillment-service   && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/saga-orchestrator     ./cmd/saga-orchestrator     && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/ai-insights-service   ./cmd/ai-insights-service   && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/notification-service  ./cmd/notification-service  && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/dashboard             ./cmd/dashboard             && \
+    CGO_ENABLED=0 GOOS=linux go build -o /out/runner                ./cmd/runner
+
+# ───────── Runtime image ─────────
+FROM alpine:3.20
+RUN apk --no-cache add ca-certificates tzdata
+WORKDIR /app
+
+# Copy all binaries
+COPY --from=builder /out/ /app/bin/
+COPY migrations/ /app/migrations/
+
+# Runner is the entrypoint — it starts all services
+ENTRYPOINT ["/app/bin/runner"]
